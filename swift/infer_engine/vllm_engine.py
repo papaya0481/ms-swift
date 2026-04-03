@@ -178,9 +178,19 @@ class VllmEngine(InferEngine):
             task_type=self.task_type)
 
     def _prepare_engine(self) -> None:
-        with patch_auto_tokenizer(self.tokenizer), patch_auto_config(self.config):
-            llm_engine_cls = AsyncLLMEngine if self.use_async_engine else LLMEngine
-            engine = llm_engine_cls.from_engine_args(self.engine_args)
+        llm_engine_cls = AsyncLLMEngine if self.use_async_engine else LLMEngine
+        try:
+            with patch_auto_tokenizer(self.tokenizer), patch_auto_config(self.config):
+                engine = llm_engine_cls.from_engine_args(self.engine_args)
+        except TypeError as e:
+            # vLLM (especially qwen3_5 multimodal path) may require its own config class.
+            # If we force-inject a transformers config via patch_auto_config, vLLM can fail
+            # with: "Invalid type of HuggingFace config ...".
+            if 'Invalid type of HuggingFace config' not in str(e):
+                raise TypeError(f'Failed to initialize vLLM engine with patch_auto_config: {e}')
+            logger.warning('Detected vLLM config type mismatch, retrying without patch_auto_config.')
+            with patch_auto_tokenizer(self.tokenizer):
+                engine = llm_engine_cls.from_engine_args(self.engine_args)
         self.engine = engine
 
     def _prepare_engine_kwargs(self, max_model_len, engine_kwargs) -> None:
