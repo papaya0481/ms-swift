@@ -961,15 +961,17 @@ class SwiftMixin:
             self.store_flos()
             self.log(logs)
 
-        if self.args.eval_use_evalscope and self.control.should_evaluate:
+        run_evalscope = self.args.eval_use_evalscope and self.control.should_evaluate
+        # When only EvalScope dataset is provided, disable HF evaluation loop while preserving checkpoint save logic.
+        if run_evalscope and not self.eval_dataset:
+            self.control.should_evaluate = False
+        super()._maybe_log_save_evaluate(tr_loss, *args, **kwargs)
+
+        if run_evalscope:
             try:
                 self._evalscope_eval()
             except Exception as e:
                 logger.warning(f'Failed to call EvalScope evaluation function: {e}.')
-
-            if not self.eval_dataset:
-                self.control.should_evaluate = False
-        super()._maybe_log_save_evaluate(tr_loss, *args, **kwargs)
 
     def create_loss_and_eval_metric(self, args):
         res = {}
@@ -1065,6 +1067,32 @@ class SwiftMixin:
         template = copy(self.template)
         template.packing = False
         template.padding_free = False
+
+        # Keep custom model backend args for EvalModel and avoid passing them to TaskConfig.
+        extra_eval_args = dict(self.args.extra_eval_args or {})
+        model_only_keys = {
+            'infer_backend',
+            'adapters',
+            'base_model_path',
+            'checkpoint_root',
+            'global_step',
+            'vllm_gpu_memory_utilization',
+            'vllm_tensor_parallel_size',
+            'vllm_pipeline_parallel_size',
+            'vllm_max_model_len',
+            'vllm_max_num_seqs',
+            'vllm_reserved_memory_gb',
+        }
+        eval_model_kwargs = {}
+        for key in list(extra_eval_args.keys()):
+            if key in model_only_keys:
+                eval_model_kwargs[key] = extra_eval_args.pop(key)
+        if 'infer_backend' not in eval_model_kwargs and getattr(self.args, 'infer_backend', None) is not None:
+            eval_model_kwargs['infer_backend'] = self.args.infer_backend
+        eval_model_kwargs.setdefault('base_model_path', getattr(self.model, 'model_dir', None))
+        eval_model_kwargs.setdefault('checkpoint_root', self.args.output_dir)
+        eval_model_kwargs.setdefault('global_step', self.state.global_step)
+
         # prepare task config
         task_config_kwargs = dict(
             model=EvalModel(
@@ -1072,6 +1100,7 @@ class SwiftMixin:
                 model=self.model,
                 template=template,
                 max_batch_size=self.args.per_device_eval_batch_size,
+                **eval_model_kwargs,
             ),
             eval_type='swift_custom',
             datasets=self.args.eval_dataset,
@@ -1081,7 +1110,7 @@ class SwiftMixin:
             eval_batch_size=self.args.per_device_eval_batch_size,
             generation_config=self.args.eval_generation_config or {'max_tokens': 512},
         )
-        task_config_kwargs.update(self.args.extra_eval_args or {})
+        task_config_kwargs.update(extra_eval_args)
         task_config = TaskConfig(**task_config_kwargs)
         # start evaluation
         eval_report = run_task(task_config)
