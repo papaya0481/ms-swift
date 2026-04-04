@@ -2,8 +2,8 @@
 EvalScope integration utilities for ms-swift models.
 
 This module provides a custom ModelAPI implementation that enables batch inference
-for evaluation tasks using ms-swift infer engines. It implements an asynchronous
-batch processing system to improve throughput when evaluating models.
+for evaluation tasks using ms-swift infer engines. It supports both asynchronous
+batch processing for throughput and synchronous mode for stricter memory behavior.
 """
 
 import os
@@ -108,6 +108,7 @@ class EvalModel(ModelAPI):
         self.adapters = collect_model_arg('adapters')
         self.checkpoint_root = collect_model_arg('checkpoint_root')
         self.global_step = collect_model_arg('global_step')
+        self.eval_sync_mode = self._to_bool(collect_model_arg('eval_sync_mode'), False)
 
         self.vllm_gpu_memory_utilization = collect_model_arg('vllm_gpu_memory_utilization')
         self.vllm_tensor_parallel_size = collect_model_arg('vllm_tensor_parallel_size')
@@ -115,6 +116,9 @@ class EvalModel(ModelAPI):
         self.vllm_max_model_len = collect_model_arg('vllm_max_model_len')
         self.vllm_max_num_seqs = collect_model_arg('vllm_max_num_seqs')
         self.vllm_reserved_memory_gb = collect_model_arg('vllm_reserved_memory_gb')
+        self.vllm_enforce_eager = collect_model_arg('vllm_enforce_eager')
+        self.vllm_enable_prefix_caching = collect_model_arg('vllm_enable_prefix_caching')
+        self.vllm_disable_custom_all_reduce = collect_model_arg('vllm_disable_custom_all_reduce')
 
         # Initialize the inference engine with batch support.
         # Keep Transformers as default behavior for backward compatibility.
@@ -196,6 +200,23 @@ class EvalModel(ModelAPI):
         except Exception:
             return default
 
+    @staticmethod
+    def _to_bool(value: Any, default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+        return bool(value)
+
+    @staticmethod
+    def _is_oom_exception(ex: Exception) -> bool:
+        if isinstance(ex, torch.cuda.OutOfMemoryError):
+            return True
+        msg = str(ex).lower()
+        return 'out of memory' in msg or 'cuda error: out of memory' in msg
+
     def _choose_safe_vllm_utilization(self) -> float:
         requested = self._to_float(self.vllm_gpu_memory_utilization, 0.9)
         requested = min(max(requested, 0.1), 0.95)
@@ -243,18 +264,52 @@ class EvalModel(ModelAPI):
         if max_model_len == 0:
             max_model_len = None
 
-        gpu_memory_utilization = self._choose_safe_vllm_utilization()
-        logger.info(f'Using VllmEngine for eval. model={model_path}, adapter={adapter_path}')
-        return VllmEngine(
-            model_path,
-            template=self.template,
-            adapters=[adapter_path],
-            gpu_memory_utilization=gpu_memory_utilization,
-            tensor_parallel_size=tensor_parallel_size,
-            pipeline_parallel_size=pipeline_parallel_size,
-            max_model_len=max_model_len,
-            max_num_seqs=max_num_seqs,
-        )
+        base_gpu_memory_utilization = self._choose_safe_vllm_utilization()
+        enforce_eager = self._to_bool(self.vllm_enforce_eager, False)
+        enable_prefix_caching = self.vllm_enable_prefix_caching
+        disable_custom_all_reduce = self._to_bool(self.vllm_disable_custom_all_reduce, True)
+
+        # GRPO-style fallback strategy: reduce concurrency and memory pressure progressively.
+        attempts = [(base_gpu_memory_utilization, max_num_seqs, max_model_len)]
+        if max_num_seqs > 1:
+            attempts.append((min(base_gpu_memory_utilization, 0.7), 1, max_model_len))
+        if max_model_len is None or max_model_len > 4096:
+            attempts.append((min(base_gpu_memory_utilization, 0.6), 1, 4096))
+        attempts.append((min(base_gpu_memory_utilization, 0.45), 1, 3072))
+
+        for attempt_idx, (gpu_memory_utilization, attempt_max_num_seqs, attempt_max_model_len) in enumerate(attempts, 1):
+            logger.info(
+                f'Using VllmEngine for eval (attempt {attempt_idx}/{len(attempts)}). '
+                f'model={model_path}, adapter={adapter_path}, '
+                f'gpu_memory_utilization={gpu_memory_utilization}, '
+                f'max_num_seqs={attempt_max_num_seqs}, max_model_len={attempt_max_model_len}')
+            try:
+                return VllmEngine(
+                    model_path,
+                    template=self.template,
+                    adapters=[adapter_path],
+                    use_async_engine=False,
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    tensor_parallel_size=tensor_parallel_size,
+                    pipeline_parallel_size=pipeline_parallel_size,
+                    max_model_len=attempt_max_model_len,
+                    max_num_seqs=attempt_max_num_seqs,
+                    enforce_eager=enforce_eager,
+                    enable_prefix_caching=enable_prefix_caching,
+                    disable_custom_all_reduce=disable_custom_all_reduce,
+                )
+            except Exception as ex:
+                if self._is_oom_exception(ex):
+                    logger.warning(
+                        f'vLLM init OOM on attempt {attempt_idx}/{len(attempts)}: {ex}. '
+                        'Retry with stricter memory settings.')
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                raise
+
+        logger.warning('All vLLM init attempts failed due to OOM; fallback to TransformersEngine for eval.')
+        return TransformersEngine(self.model, template=self.template, max_batch_size=self.max_batch_size)
 
     def generate(
         self,
@@ -278,6 +333,13 @@ class EvalModel(ModelAPI):
         Returns:
             ModelOutput containing the generated response
         """
+        # Synchronous mode avoids a background queue/thread and reduces lifecycle complexity.
+        if self.eval_sync_mode:
+            ms_input = convert_request(input, tools)
+            ms_config = convert_config(config)
+            completion = self.engine.infer([ms_input], ms_config, use_tqdm=False)[0]
+            return self._to_evalscope_output(completion)
+
         # Ensure the background batch processing thread is running
         global batch_thread
         if batch_thread is None:
@@ -300,6 +362,18 @@ class EvalModel(ModelAPI):
 
         # Block until the result is available
         return future.result()
+
+    @staticmethod
+    def _to_evalscope_output(completion) -> ModelOutput:
+        choices = chat_choices_from_openai(completion, tools=[])
+        usage = None
+        if completion.usage:
+            usage = ModelUsage(
+                input_tokens=completion.usage.prompt_tokens,
+                output_tokens=completion.usage.completion_tokens,
+                total_tokens=completion.usage.total_tokens,
+            )
+        return ModelOutput(model=completion.model, choices=choices, usage=usage)
 
 
 def _process_batches() -> None:
@@ -346,16 +420,7 @@ def _process_batches() -> None:
                 completion = completions[i]
 
                 # Convert ms-swift response to EvalScope format
-                choices = chat_choices_from_openai(completion, tools=[])
-                result = ModelOutput(
-                    model=completion.model,
-                    choices=choices,
-                    usage=(ModelUsage(
-                        input_tokens=completion.usage.prompt_tokens,
-                        output_tokens=completion.usage.completion_tokens,
-                        total_tokens=completion.usage.total_tokens,
-                    ) if completion.usage else None),
-                )
+                result = EvalModel._to_evalscope_output(completion)
 
                 # Deliver the result to the waiting caller
                 future.set_result(result)
@@ -384,8 +449,8 @@ def convert_config(config: GenerateConfig) -> RequestConfig:
         temperature=config.temperature,
         top_k=config.top_k,
         top_p=config.top_p,
-        presence_penalty=config.presence_penalty,
-        frequency_penalty=config.frequency_penalty,
+        presence_penalty=(0.0 if config.presence_penalty is None else config.presence_penalty),
+        frequency_penalty=(0.0 if config.frequency_penalty is None else config.frequency_penalty),
         seed=config.seed,
         stream=False,  # batch processing doesn't support streaming
         logprobs=config.logprobs,

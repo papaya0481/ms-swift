@@ -445,7 +445,9 @@ class VllmEngine(InferEngine):
         # TODO: beam search
         for key in ['n', 'best_of', 'frequency_penalty', 'presence_penalty', 'seed']:
             if hasattr(SamplingParams, key):
-                kwargs[key] = getattr(request_config, key)
+                value = getattr(request_config, key)
+                if value is not None:
+                    kwargs[key] = value
 
         # Handle structured outputs (guided decoding)
         # vLLM v0.12+ uses 'structured_outputs' parameter, older versions use 'guided_decoding'

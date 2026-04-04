@@ -1076,12 +1076,16 @@ class SwiftMixin:
             'base_model_path',
             'checkpoint_root',
             'global_step',
+            'eval_sync_mode',
             'vllm_gpu_memory_utilization',
             'vllm_tensor_parallel_size',
             'vllm_pipeline_parallel_size',
             'vllm_max_model_len',
             'vllm_max_num_seqs',
             'vllm_reserved_memory_gb',
+            'vllm_enforce_eager',
+            'vllm_enable_prefix_caching',
+            'vllm_disable_custom_all_reduce',
         }
         eval_model_kwargs = {}
         for key in list(extra_eval_args.keys()):
