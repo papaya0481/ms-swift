@@ -116,11 +116,40 @@ class EvalArguments(DeployArguments):
 
     def _init_result_path(self, folder_name: str) -> None:
         self.time = dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-        result_dir = self.ckpt_dir or f'result/{self.model_suffix}'
+        result_dir = self._get_eval_result_dir()
         os.makedirs(result_dir, exist_ok=True)
         self.result_jsonl = to_abspath(os.path.join(result_dir, 'eval_result.jsonl'))
-        if not self.eval_url:
-            super()._init_result_path('eval_result')
+        if self.eval_url:
+            return
+
+        if self.result_path is not None:
+            self.result_path = to_abspath(self.result_path)
+            return
+
+        eval_result_dir = to_abspath(os.path.join(result_dir, folder_name))
+        os.makedirs(eval_result_dir, exist_ok=True)
+        time = dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+        self.result_path = os.path.join(eval_result_dir, f'{time}.jsonl')
+        logger.info(f'args.result_path: {self.result_path}')
+
+    def _get_eval_result_dir(self) -> str:
+        adapters = list(getattr(self, 'adapters', []) or [])
+        adapters += list(getattr(self, 'adapter_mapping', {}).values())
+        if not adapters:
+            return self.ckpt_dir or f'result/{self.model_suffix}'
+
+        adapter_names = []
+        for adapter in adapters:
+            adapter_name = os.path.basename(os.path.normpath(adapter))
+            if adapter_name:
+                adapter_names.append(adapter_name)
+
+        if not adapter_names:
+            return f'result/{self.model_suffix}'
+
+        model_name = self.model_suffix.replace('/', '_')
+        merged_name = '+'.join([model_name] + adapter_names).replace('/', '_')
+        return f'result/{merged_name}'
 
     def _init_torch_dtype(self) -> None:
         if self.eval_url:
